@@ -1,1 +1,4 @@
-
+requests
+matplotlib
+pillow
+sqlite3
