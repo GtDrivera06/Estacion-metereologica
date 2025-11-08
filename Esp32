@@ -1,1 +1,180 @@
 
+# main.py – ESP32 con DHT11 y MQ-8 (lectura REAL)
+# Envía datos cada minuto sincronizado a la hora de Guatemala (UTC-6)
+
+import time, ujson
+from machine import Pin, ADC
+import network
+from umqtt.simple import MQTTClient
+import ntptime
+import dht   # <- LIBRERÍA NATIVA DE MICROPYTHON
+
+# ========= CONFIG =========
+WIFI_SSID = "HONOR X7"
+WIFI_PASSWORD = "boteo000"
+
+MQTT_BROKER = "test.mosquitto.org"
+MQTT_PORT = 1883
+
+ESTACION_ID = 3
+
+# ========= SENSORES =========
+dht_pin = Pin(18, Pin.IN)       # TU PIN PARA DHT11
+dht_sensor = dht.DHT11(dht_pin)
+
+mq8_adc = ADC(Pin(34))          # ADC en GPIO34
+mq8_adc.atten(ADC.ATTN_11DB)    # Rango completo ~3.3V
+mq8_adc.width(ADC.WIDTH_12BIT)  # Lectura 0–4095
+
+# ========= LED opcional =========
+try:
+    led = Pin(13, Pin.OUT)
+    led.off()
+except:
+    led = None
+
+
+# ===============================================================
+# ✅ WIFI
+# ===============================================================
+def conectar_wifi():
+    print("Conectando a WiFi...")
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+
+    for _ in range(20):
+        if wlan.isconnected():
+            print("WiFi OK:", wlan.ifconfig())
+            return True
+        time.sleep(1)
+
+    print("ERROR: No se pudo conectar a WiFi")
+    return False
+
+
+# ===============================================================
+# ✅ NTP + HORA GUATEMALA
+# ===============================================================
+def sincronizar_hora():
+    try:
+        ntptime.host = "pool.ntp.org"
+        ntptime.settime()
+        print("Hora NTP OK")
+    except:
+        print("ERROR NTP")
+
+
+def obtener_hora_gt():
+    # Obtener UTC
+    t = time.localtime()
+    # Convertir a segundos
+    utc_secs = time.mktime(t)
+    # Restar 6 horas para Guatemala
+    gt_secs = utc_secs - (6 * 3600)
+    gt = time.localtime(gt_secs)
+
+    fecha = "{:04d}-{:02d}-{:02d}".format(gt[0], gt[1], gt[2])
+    hora = "{:02d}:{:02d}:{:02d}".format(gt[3], gt[4], gt[5])
+    return fecha, hora, gt
+
+
+def esperar_minuto_exact():
+    while True:
+        _, _, gt = obtener_hora_gt()
+        if gt[5] == 0:
+            return
+        time.sleep(0.2)
+
+
+# ===============================================================
+# ✅ MQTT
+# ===============================================================
+def conectar_mqtt():
+    try:
+        client = MQTTClient("estacion_esp32_3", MQTT_BROKER, port=MQTT_PORT)
+        client.connect()
+        print("MQTT OK")
+        return client
+    except Exception as e:
+        print("Error MQTT:", e)
+        return None
+
+
+# ===============================================================
+# ✅ LECTURAS REALES
+# ===============================================================
+def leer_dht11():
+    try:
+        dht_sensor.measure()
+        temp = dht_sensor.temperature()
+        hum  = dht_sensor.humidity()
+        return temp, hum
+    except Exception as e:
+        print("Error DHT:", e)
+        return None, None
+
+
+def leer_mq8():
+    """
+    MQ-8 entrega voltaje (0–3.3V) proporcional a concentración H2.
+    ADC devuelve un valor 0–4095.
+    """
+    adc_val = mq8_adc.read()
+
+    # Cálculo simple de "calidad de aire" basado en rango
+    if adc_val < 900:
+        calidad = 100
+    elif adc_val < 1500:
+        calidad = 90
+    elif adc_val < 2200:
+        calidad = 70
+    elif adc_val < 3000:
+        calidad = 40
+    else:
+        calidad = 15
+
+    return adc_val, calidad
+
+
+# ===============================================================
+# ✅ LOOP PRINCIPAL
+# ===============================================================
+def main():
+    print("ESP32 Estación Meteorológica – LECTURA REAL")
+    conectar_wifi()
+    sincronizar_hora()
+    mqtt = conectar_mqtt()
+
+    while True:
+        esperar_minuto_exact()  # sincronizado GT
+
+        temp, hum = leer_dht11()
+        mq_raw, air = leer_mq8()
+        fecha, hora, _ = obtener_hora_gt()
+
+        data = {
+            "Fecha": fecha,
+            "Hora": hora,
+            "temperatura": temp,
+            "humedad": hum,
+            "mq8_raw": mq_raw,
+            "calidadAire": air,
+            "estacion": ESTACION_ID
+        }
+
+        print("Enviado:", ujson.dumps(data))
+
+        if mqtt:
+            mqtt.publish("umes/clima", ujson.dumps(data))
+
+        if led:
+            led.on()
+            time.sleep(0.2)
+            led.off()
+
+        # Evitar doble envío en segundo 00
+        time.sleep(1.2)
+
+
+main()
